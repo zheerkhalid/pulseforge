@@ -137,6 +137,17 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// Minutes that local time is ahead of UTC right now.
+/// Days since 1970-01-01 for a calendar date (the inverse of [`civil_from_days`]).
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (i64::from(month) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 pub fn local_offset_minutes() -> i64 {
     #[cfg(windows)]
     {
@@ -255,6 +266,13 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2024, 2, 29), 19_782);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        for days in [-800_000, -1, 0, 59, 11_016, 20_833, 400_000] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
     }
 
     #[test]

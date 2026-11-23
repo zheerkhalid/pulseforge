@@ -92,7 +92,79 @@ pub fn restart_as_admin() -> Result<(), String> {
         return Err("Demo mode: nothing on this PC is changed.".into());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    shell_execute("runas", &exe.to_string_lossy(), "")
+    // This copy is still running while the elevated one starts: tell the new
+    // one not to hand over to it.
+    shell_execute("runas", &exe.to_string_lossy(), NEW_INSTANCE_FLAG)
+}
+
+// ----------------------------------------------------------------------------------
+// One copy at a time
+// ----------------------------------------------------------------------------------
+
+/// Command-line switch that starts a second copy on purpose.
+pub const NEW_INSTANCE_FLAG: &str = "--new-instance";
+/// Posted to the tray thread's window to bring the main window up.
+pub const WM_SHOW_MAIN: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 6;
+
+/// What a starting copy should do about a copy that may already be running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Startup {
+    /// No other copy: carry on.
+    Run,
+    /// Another copy is running and has been told what it needs to know: exit.
+    HandOver,
+}
+
+/// The decision behind [`claim_instance`], separated from the Windows calls.
+/// `exists`: another copy holds the name. `quiet`: this start was the silent
+/// start with Windows. `shown`: the other copy accepted the request to show
+/// its window.
+pub fn startup_decision(exists: bool, quiet: bool, shown: bool) -> Startup {
+    if !exists {
+        Startup::Run
+    } else if quiet || shown {
+        Startup::HandOver
+    } else {
+        // The other copy cannot be reached (it is still starting, is closing,
+        // or runs with higher rights): better two windows than none.
+        Startup::Run
+    }
+}
+
+/// Makes this the one running copy, or asks the copy that already runs to
+/// show its window. `quiet` is the start with Windows (`--tray`), which must
+/// never pop a window up.
+pub fn claim_instance(quiet: bool) -> Startup {
+    use windows::core::w;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, LPARAM, WPARAM};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AllowSetForegroundWindow, FindWindowW, GetWindowThreadProcessId, PostMessageW,
+    };
+    // SAFETY: plain calls. The mutex handle is kept for the life of the
+    // process on purpose: it is what marks this copy as running.
+    unsafe {
+        let mutex = CreateMutexW(None, false, w!("Local\\PulseForge.OneCopy"));
+        let exists = mutex.is_ok() && GetLastError() == ERROR_ALREADY_EXISTS;
+        let mut shown = false;
+        if exists && !quiet {
+            if let Ok(window) = FindWindowW(w!("PulseForgeTrayWindow"), PCWSTR::null()) {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(window, Some(&mut pid));
+                if pid != 0 {
+                    let _ = AllowSetForegroundWindow(pid);
+                }
+                shown = PostMessageW(window, WM_SHOW_MAIN, WPARAM(0), LPARAM(0)).is_ok();
+            }
+        }
+        let decision = startup_decision(exists, quiet, shown);
+        if decision == Startup::HandOver {
+            if let Ok(handle) = mutex {
+                let _ = CloseHandle(handle);
+            }
+        }
+        decision
+    }
 }
 
 /// Opens a web link in the default browser. Only http(s) links are accepted.
@@ -313,6 +385,65 @@ pub fn show_window(raw: isize) {
     }
 }
 
+/// Puts `text` on the clipboard as plain text.
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    if is_demo() {
+        return Err("Demo mode: nothing is copied.".into());
+    }
+    const CF_UNICODETEXT: u32 = 13;
+    let data = wide(text);
+    let failed = || "Windows did not accept the text for the clipboard.".to_string();
+    // SAFETY: the block is allocated with room for the whole NUL-terminated
+    // string and filled while locked. Once SetClipboardData succeeds the
+    // clipboard owns it; on any earlier failure it is freed here.
+    unsafe {
+        let block =
+            GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of_val(&data[..])).map_err(|_| failed())?;
+        let target = GlobalLock(block) as *mut u16;
+        if target.is_null() {
+            let _ = GlobalFree(block);
+            return Err(failed());
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len());
+        let _ = GlobalUnlock(block);
+        if OpenClipboard(HWND::default()).is_err() {
+            let _ = GlobalFree(block);
+            return Err("The clipboard is in use by another program. Try again.".into());
+        }
+        let _ = EmptyClipboard();
+        let set = SetClipboardData(CF_UNICODETEXT, HANDLE(block.0));
+        let _ = CloseClipboard();
+        if set.is_err() {
+            let _ = GlobalFree(block);
+            return Err(failed());
+        }
+    }
+    Ok(())
+}
+
+/// The whole desktop (all displays together) as left, top, width and height
+/// in pixels.
+pub fn desktop_rect() -> (i32, i32, i32, i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+    // SAFETY: plain queries without side effects.
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
+}
+
 /// True while the window has been sent to the tray with [`hide_window`].
 pub fn window_hidden() -> bool {
     HIDDEN.load(Ordering::SeqCst)
@@ -364,10 +495,28 @@ mod tests {
     }
 
     #[test]
+    fn a_second_copy_hands_over_only_when_the_first_can_be_reached() {
+        assert_eq!(startup_decision(false, false, false), Startup::Run);
+        assert_eq!(startup_decision(false, true, false), Startup::Run);
+        // A normal second start shows the running window and exits.
+        assert_eq!(startup_decision(true, false, true), Startup::HandOver);
+        // The start with Windows never opens a window: it just exits.
+        assert_eq!(startup_decision(true, true, false), Startup::HandOver);
+        // The running copy could not be told: start anyway.
+        assert_eq!(startup_decision(true, false, false), Startup::Run);
+    }
+
+    #[test]
     fn urls_are_filtered() {
         assert!(open_url("file:///C:/Windows").is_err());
         assert!(open_url("https://zheer.dev\" & calc").is_err());
         assert!(open_url("calc.exe").is_err());
+    }
+
+    #[test]
+    fn the_desktop_has_a_size() {
+        let (_, _, width, height) = desktop_rect();
+        assert!(width > 0 && height > 0);
     }
 
     #[test]

@@ -31,6 +31,31 @@ pub fn log_interval_label(seconds: u32) -> String {
     }
 }
 
+/// How long CSV log files can be kept, in days (0 = for ever).
+pub const LOG_KEEP_DAYS: [u32; 4] = [0, 7, 30, 90];
+
+/// "For ever", "7 days".
+pub fn log_keep_label(days: u32) -> String {
+    match days {
+        0 => "For ever".to_string(),
+        1 => "1 day".to_string(),
+        n => format!("{n} days"),
+    }
+}
+
+/// The keyboard shortcuts, as the Settings page lists them.
+pub const SHORTCUTS: [(&str, &str); 9] = [
+    ("Ctrl+1 ... Ctrl+0", "Open a page"),
+    ("Ctrl+Tab", "Next page"),
+    ("Ctrl+Shift+Tab", "Previous page"),
+    ("Ctrl+F", "Search the processes"),
+    ("Ctrl+E", "Export a report"),
+    ("Ctrl+Shift+C", "Copy a summary"),
+    ("Ctrl+M", "Mini widget on or off"),
+    ("F5", "Read the hardware again"),
+    ("Space", "Pause the graphs"),
+];
+
 /// The file name proposed for a report made at `unix`.
 pub fn report_file_name(unix: u64, format: Format) -> String {
     format!(
@@ -138,6 +163,15 @@ impl App {
                     },
                 );
                 self.settings.history_window = window;
+                widgets::divider(ui);
+                let mut remember = self.settings.remember_page;
+                setting_row(
+                    ui,
+                    "Open where I left off",
+                    "Starts on the page that was open when PulseForge was closed. The window size is always remembered.",
+                    |ui| switch(ui, &mut remember),
+                );
+                self.settings.remember_page = remember;
             });
 
             widgets::card(ui, |ui| {
@@ -257,6 +291,26 @@ impl App {
                 });
                 self.settings.log_interval_s = every;
                 widgets::divider(ui);
+                let mut keep = self.settings.log_keep_days;
+                setting_row(
+                    ui,
+                    "Keep the files",
+                    "Older log files are deleted while logging is on. Only PulseForge's own files in the folder are ever removed.",
+                    |ui| {
+                        let labels: Vec<String> =
+                            LOG_KEEP_DAYS.iter().map(|d| log_keep_label(*d)).collect();
+                        let labels: Vec<&str> = labels.iter().map(|l| l.as_str()).collect();
+                        let current = LOG_KEEP_DAYS
+                            .iter()
+                            .position(|d| *d == keep)
+                            .unwrap_or(usize::MAX);
+                        if let Some(i) = widgets::segmented(ui, &labels, current) {
+                            keep = LOG_KEEP_DAYS[i];
+                        }
+                    },
+                );
+                self.settings.log_keep_days = keep;
+                widgets::divider(ui);
                 let folder = self.settings.log_folder();
                 setting_row(ui, "Folder", &folder.to_string_lossy(), |ui| {
                     if widgets::ghost_button(ui, &Icon::FOLDER_OPEN.with("Open folder")).clicked() {
@@ -373,6 +427,16 @@ impl App {
                         ("Graph history", util::fmt_bytes(o.history_bytes as u64)),
                     ],
                 );
+            });
+
+            widgets::card(ui, |ui| {
+                widgets::section(ui, "Keyboard shortcuts");
+                let items: Vec<(&str, String)> = SHORTCUTS
+                    .iter()
+                    .map(|(keys, what)| (*what, keys.to_string()))
+                    .collect();
+                let columns = pages::columns_for(ui.available_width(), 190.0, 3);
+                pages::facts(ui, columns, &items);
             });
 
             widgets::card(ui, |ui| {

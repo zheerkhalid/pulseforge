@@ -80,6 +80,17 @@ pub struct Settings {
     pub log_dir: String,
     /// Seconds between rows in the CSV log.
     pub log_interval_s: u32,
+    /// Days a CSV log file is kept before it is deleted; 0 keeps them for ever.
+    pub log_keep_days: u32,
+
+    /// Open the page that was showing when the program was closed.
+    pub remember_page: bool,
+    /// Name of that page (see `Tab::name`).
+    pub last_page: String,
+    /// Size of the window when it was last closed, in points.
+    pub window_size: Option<(f32, f32)>,
+    /// One row per program name on the Processes page.
+    pub group_processes: bool,
 
     /// Mask serial numbers and names in exported reports.
     pub report_mask: bool,
@@ -104,6 +115,11 @@ impl Default for Settings {
             log_csv: false,
             log_dir: String::new(),
             log_interval_s: 5,
+            log_keep_days: 0,
+            remember_page: true,
+            last_page: String::new(),
+            window_size: None,
+            group_processes: false,
             report_mask: true,
         }
     }
@@ -119,6 +135,18 @@ impl Settings {
             self.history_window = 1;
         }
         self.log_interval_s = self.log_interval_s.clamp(1, 3600);
+        self.log_keep_days = self.log_keep_days.min(3650);
+        // A window size that makes no sense (a damaged file, a display that
+        // is gone) falls back to the default size.
+        if let Some((w, h)) = self.window_size {
+            let sane = w.is_finite() && h.is_finite() && w >= 640.0 && h >= 480.0;
+            self.window_size = sane.then_some((w.min(7680.0), h.min(4320.0)));
+        }
+        if let Some((x, y)) = self.mini_pos {
+            if !(x.is_finite() && y.is_finite()) {
+                self.mini_pos = None;
+            }
+        }
         alerts::normalize(&mut self.alerts);
     }
 
@@ -192,6 +220,27 @@ mod tests {
         assert_eq!(loaded.interval_ms, 1000);
         assert_eq!(loaded.history_window, 1);
         assert_eq!(loaded.alerts, alerts::default_rules());
+        // New options keep their defaults when an older file is loaded.
+        assert_eq!(loaded.log_keep_days, 0);
+        assert!(loaded.remember_page);
+        assert_eq!(loaded.window_size, None);
+        // Nonsense sizes and positions are dropped, big ones are capped.
+        std::fs::write(
+            &path,
+            r#"{"window_size":[10.0,5.0],"log_keep_days":999999}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.window_size, None);
+        assert_eq!(loaded.log_keep_days, 3650);
+        let mut big = Settings {
+            window_size: Some((99_999.0, 900.0)),
+            mini_pos: Some((f32::NAN, 3.0)),
+            ..Default::default()
+        };
+        big.sanitize();
+        assert_eq!(big.window_size, Some((7680.0, 900.0)));
+        assert_eq!(big.mini_pos, None);
         // Broken files fall back entirely.
         std::fs::write(&path, "{{{").unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());

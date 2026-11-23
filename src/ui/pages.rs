@@ -39,6 +39,8 @@ pub struct PageState {
     pub process_sort: ProcessColumn,
     pub process_descending: bool,
     pub process_selected: Option<u32>,
+    /// Put the keyboard into the process search box on the next frame (Ctrl+F).
+    pub focus_search: bool,
     /// The process the "End task" confirmation is open for: id and name.
     pub end_task: Option<(u32, String)>,
 
@@ -69,6 +71,7 @@ impl Default for PageState {
             process_sort: ProcessColumn::Cpu,
             process_descending: true,
             process_selected: None,
+            focus_search: false,
             end_task: None,
             sensor_filter: None,
             export_open: false,
@@ -107,6 +110,26 @@ impl App {
                     self.st.process_selected = Some(pid);
                     self.st.end_task = Some((pid, name));
                 }
+            }
+            "processes-grouped" | "processes-details" => {
+                // The busiest program selected, so that its details show.
+                let grouped = view == "processes-grouped";
+                self.settings.group_processes = grouped;
+                let sample = self.monitor.snapshot().2;
+                let list: Vec<crate::model::ProcessSample> = if grouped {
+                    super::processes::group_by_name(&sample.processes)
+                        .into_iter()
+                        .filter(|(_, n)| *n > 1)
+                        .map(|(g, _)| g)
+                        .collect()
+                } else {
+                    sample.processes.clone()
+                };
+                self.st.process_selected =
+                    super::hardware::top_processes(&list, super::hardware::TopBy::Cpu, 12)
+                        .into_iter()
+                        .find(|q| q.user != "SYSTEM" && q.pid > 4)
+                        .map(|q| q.pid);
             }
             "export" | "export-report" => self.open_export(),
             "mini" | "mini-widget" => self.st.mini_preview = true,

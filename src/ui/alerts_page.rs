@@ -325,12 +325,49 @@ impl App {
         }
     }
 
-    fn history_ui(&self, ui: &mut Ui) {
+    fn history_ui(&mut self, ui: &mut Ui) {
         let p = pal(ui);
         let f = self.settings.fahrenheit;
-        widgets::section(ui, "History");
-        if self.data.events.is_empty() {
-            pages::note(ui, "No alert has fired since PulseForge started.");
+        let empty = self.data.events.is_empty();
+        let mut clear = false;
+        // A fixed height: a right-to-left row takes all the height it can get.
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), 30.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                widgets::section(ui, "History");
+                if !empty {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let button =
+                            egui::Button::new(RichText::new("Clear").size(12.5).color(p.muted))
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0_f32, p.border))
+                                .corner_radius(egui::CornerRadius::same(7));
+                        if ui
+                            .add(button)
+                            .on_hover_text(
+                                "Forget the alerts listed here. The limits stay as they are.",
+                            )
+                            .clicked()
+                        {
+                            clear = true;
+                        }
+                    });
+                }
+            },
+        );
+        if clear {
+            self.monitor.clear_events();
+            self.st.demo_events.clear();
+            self.data.events.clear();
+            self.toast("The alert history is empty.", false);
+            return;
+        }
+        if empty {
+            pages::note(
+                ui,
+                "No alert has fired yet. Alerts are kept here, also after PulseForge is restarted.",
+            );
             return;
         }
         pages::note(ui, "Newest first.");

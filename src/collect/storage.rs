@@ -15,10 +15,13 @@ use windows::Win32::Storage::FileSystem::{
     GetVolumeInformationW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_EXISTING,
 };
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Diagnostics::Debug::{
     SetThreadErrorMode, SEM_FAILCRITICALERRORS, THREAD_ERROR_MODE,
 };
 use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::UI::Shell::PropertiesSystem::{PSGetPropertyKeyFromName, PROPERTYKEY};
+use windows::Win32::UI::Shell::{IShellItem2, SHCreateItemFromParsingName};
 
 /// Highest `PhysicalDriveN` index that is probed.
 const MAX_DRIVE_INDEX: u32 = 63;
@@ -814,6 +817,10 @@ pub fn volumes() -> Vec<Volume> {
     // empty card readers. The previous mode is restored below.
     let mode_set =
         unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, Some(&mut old_mode)) }.is_ok();
+    // SAFETY: initialises COM for this thread (the shell is asked for the
+    // encryption state); balanced below when it succeeded.
+    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let key = bitlocker_key();
     let mut out = Vec::new();
     for root in logical_roots() {
         let w = wide(&root);
@@ -860,7 +867,11 @@ pub fn volumes() -> Vec<Volume> {
             filesystem: from_wide(&filesystem),
             total,
             free: free.min(total),
-            bitlocker: None,
+            bitlocker: if kind == "Fixed" || kind == "Removable" {
+                key.as_ref().and_then(|key| bitlocker_state(&root, key))
+            } else {
+                None
+            },
             kind: kind.to_string(),
         });
     }
@@ -868,7 +879,50 @@ pub fn volumes() -> Vec<Volume> {
         // SAFETY: restores the mode saved above.
         let _ = unsafe { SetThreadErrorMode(old_mode, None) };
     }
+    if com.is_ok() {
+        // SAFETY: balances the successful initialisation above.
+        unsafe { CoUninitialize() };
+    }
     out
+}
+
+/// What the shell's "BitLocker protection" number means: `Some(true)` for a
+/// volume whose contents are encrypted (protection on, locked, suspended or
+/// still being encrypted or decrypted), `Some(false)` for one that is not,
+/// `None` when Windows does not say.
+pub fn bitlocker_from_code(code: i32) -> Option<bool> {
+    match code {
+        1 | 3 | 4 | 5 | 6 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+/// The key of the shell property that holds a volume's BitLocker state.
+/// Windows is asked for it by name, so no number is taken for granted.
+fn bitlocker_key() -> Option<PROPERTYKEY> {
+    let mut key = PROPERTYKEY::default();
+    // SAFETY: a constant NUL-terminated name and a valid out-parameter.
+    unsafe {
+        PSGetPropertyKeyFromName(
+            windows::core::w!("System.Volume.BitLockerProtection"),
+            &mut key,
+        )
+    }
+    .ok()?;
+    Some(key)
+}
+
+/// The encryption state of a volume, read from the same property Explorer
+/// uses for its padlock. A read-only query that needs no administrator
+/// rights; the calling thread must have COM initialised.
+fn bitlocker_state(root: &str, key: &PROPERTYKEY) -> Option<bool> {
+    let w = wide(root);
+    // SAFETY: NUL-terminated path; the interface is released when dropped.
+    unsafe {
+        let item: IShellItem2 = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok()?;
+        bitlocker_from_code(item.GetInt32(key).ok()?)
+    }
 }
 
 struct Tracked {
@@ -1232,6 +1286,34 @@ mod tests {
         for v in &vols {
             assert!(v.free <= v.total);
             assert!((0.0..=100.0).contains(&v.used_pct()));
+        }
+        // Windows knows the property by name, and says for the system volume
+        // whether it is encrypted (as a standard user, too).
+        assert!(bitlocker_key().is_some());
+        println!(
+            "volumes: encryption state known for {}",
+            vols.iter().filter(|v| v.bitlocker.is_some()).count()
+        );
+        assert!(vols
+            .iter()
+            .any(|v| v.kind == "Fixed" && v.bitlocker.is_some()));
+        // Reading it twice leaves COM balanced and gives the same answer.
+        let again = volumes();
+        assert_eq!(
+            vols.iter().map(|v| v.bitlocker).collect::<Vec<_>>(),
+            again.iter().map(|v| v.bitlocker).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bitlocker_codes() {
+        // On, being encrypted, being decrypted, suspended, locked.
+        for code in [1, 3, 4, 5, 6] {
+            assert_eq!(bitlocker_from_code(code), Some(true), "{code}");
+        }
+        assert_eq!(bitlocker_from_code(2), Some(false));
+        for code in [0, 7, -1, 100] {
+            assert_eq!(bitlocker_from_code(code), None, "{code}");
         }
     }
 

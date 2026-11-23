@@ -436,6 +436,59 @@ fn tiles(inventory: &Inventory, slow: &Slow, sample: &Sample) -> Vec<Tile> {
     out
 }
 
+/// The computer in a few lines, for pasting into a message or a forum post:
+/// what it is, not how it is doing. It holds no serial number, computer or
+/// user name and no network address, so it needs no masking.
+pub fn summary(inventory: &Inventory, slow: &Slow, sample: &Sample) -> String {
+    let sys = &inventory.system;
+    let mut lines = Vec::new();
+    for tile in tiles(inventory, slow, sample) {
+        match tile.label.as_str() {
+            // The charge changes by the minute: not part of a specification.
+            "Battery" => {}
+            "Computer" => {
+                lines.push(format!("Computer: {}", tile.value));
+                let mut windows = tile.detail.clone();
+                if !sys.os_build.trim().is_empty() {
+                    windows = joined(&[&windows, &format!("(build {})", sys.os_build.trim())]);
+                }
+                if !windows.trim().is_empty() {
+                    lines.push(format!("Windows: {windows}"));
+                }
+            }
+            label => {
+                // "Drive 0" and "Drive 1" are both simply storage to a reader.
+                let label = if label.starts_with("Drive ") {
+                    "Storage"
+                } else {
+                    label
+                };
+                let detail = tile.detail.replace("\u{b7} ", "");
+                if detail.trim().is_empty() {
+                    lines.push(format!("{label}: {}", tile.value));
+                } else {
+                    lines.push(format!("{label}: {} ({})", tile.value, detail.trim()));
+                }
+            }
+        }
+    }
+    for d in inventory
+        .displays
+        .iter()
+        .filter(|d| d.width > 0 && d.height > 0)
+    {
+        let mut line = format!("Display: {} x {}", d.width, d.height);
+        if d.refresh_hz > 0.0 {
+            line.push_str(&format!(", {} Hz", number(f64::from(d.refresh_hz))));
+        }
+        if let Some(inches) = d.diagonal_inches.filter(|i| *i > 0.0) {
+            line.push_str(&format!(", {inches:.1} inch"));
+        }
+        lines.push(line);
+    }
+    lines.join("\r\n")
+}
+
 fn sensor_value(sensor: &SensorReading, fahrenheit: bool) -> String {
     match sensor.value {
         None => "not available".to_string(),
@@ -761,6 +814,11 @@ fn volume_rows(slow: &Slow, drive: Option<u32>) -> Vec<Vec<Cell>> {
                 } else {
                     Cell::default()
                 },
+                Cell::text(match v.bitlocker {
+                    Some(true) => "Encrypted",
+                    Some(false) => "Not encrypted",
+                    None => "",
+                }),
                 Cell::text(
                     v.drive_index
                         .map(|i| format!("Drive {i}"))
@@ -771,7 +829,7 @@ fn volume_rows(slow: &Slow, drive: Option<u32>) -> Vec<Vec<Cell>> {
         .collect()
 }
 
-const VOLUME_HEAD: [&str; 8] = [
+const VOLUME_HEAD: [&str; 9] = [
     "Volume",
     "Label",
     "File system",
@@ -779,6 +837,7 @@ const VOLUME_HEAD: [&str; 8] = [
     "Size",
     "Free",
     "Usage",
+    "Encryption",
     "On",
 ];
 
@@ -1964,6 +2023,27 @@ mod tests {
             assert!(hidden.contains(&mask_serial(DRIVE_SERIAL)));
         }
         let (inventory, slow, sample) = fixture();
+        // The short summary for the clipboard names the parts and gives
+        // nothing identifying away, without any masking.
+        let short = summary(&inventory, &slow, &sample);
+        for kept in [
+            "Computer: ",
+            "Falcon 15",
+            "Processor: Example Core 9 1490X",
+            "Storage: Fabrikam Rocket 2TB",
+            "Display: ",
+        ] {
+            assert!(short.contains(kept), "summary: {kept} is missing\n{short}");
+        }
+        for secret in [SYSTEM_SERIAL, DRIVE_SERIAL, COMPUTER, USER, IPV4] {
+            assert!(!short.contains(secret), "summary gives {secret} away");
+        }
+        assert!(!short.contains("Battery"));
+        assert!(short.lines().count() >= 5);
+        assert_eq!(
+            summary(&Inventory::default(), &Slow::default(), &Sample::default()),
+            ""
+        );
         let data = ReportData {
             inventory: &inventory,
             slow: &slow,

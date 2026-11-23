@@ -388,6 +388,12 @@ unsafe extern "system" fn wnd_proc(
             show_pending(window);
             LRESULT(0)
         }
+        // Sent by a second copy of the program that was started while this
+        // one runs: show the window instead of opening another.
+        sys::WM_SHOW_MAIN => {
+            show_main();
+            LRESULT(0)
+        }
         WM_QUIT_THREAD => {
             with_state(|s| s.enabled = false);
             sync(window);

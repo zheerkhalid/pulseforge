@@ -33,6 +33,33 @@ pub struct MiniShared {
     pub position: Mutex<Option<(f32, f32)>>,
     /// True while the viewport is being shown.
     pub open: AtomicBool,
+    /// Set by the widget when the user asks for the main window.
+    pub show_main: AtomicBool,
+    /// The main window, so that the widget can bring it back while that
+    /// window's own event loop is asleep in the notification area.
+    pub main_window: std::sync::atomic::AtomicIsize,
+}
+
+/// Where the widget may open: `pos` (its remembered top-left corner, in
+/// points) if enough of the widget would be on the desktop to grab it, and
+/// `None` (let Windows place it) if not, for instance because the display
+/// it was left on is gone. `desktop` is the whole desktop as left, top,
+/// width and height in points.
+pub fn keep_on_screen(
+    pos: Option<(f32, f32)>,
+    size: [f32; 2],
+    desktop: (f32, f32, f32, f32),
+) -> Option<(f32, f32)> {
+    /// How much of the widget must stay reachable, in points.
+    const GRIP: f32 = 48.0;
+    let (x, y) = pos?;
+    let (left, top, width, height) = desktop;
+    if !(x.is_finite() && y.is_finite()) || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let on_x = x + size[0] >= left + GRIP && x <= left + width - GRIP;
+    let on_y = y >= top && y <= top + height - GRIP;
+    (on_x && on_y).then_some((x, y))
 }
 
 /// The few numbers the widget shows.
@@ -223,6 +250,9 @@ impl App {
         if mini.close_requested.swap(false, Ordering::Relaxed) {
             self.settings.mini_widget = false;
         }
+        if mini.show_main.swap(false, Ordering::Relaxed) {
+            self.bring_up(ctx);
+        }
         if let Ok(pos) = mini.position.lock() {
             if pos.is_some() && *pos != self.settings.mini_pos {
                 self.settings.mini_pos = *pos;
@@ -238,10 +268,28 @@ impl App {
             .store(self.settings.interval_ms, Ordering::Relaxed);
         let first = !mini.open.swap(true, Ordering::Relaxed);
         if first {
-            // The window starts where it was left; afterwards it is only
-            // moved by the user.
-            self.st.mini_start = self.settings.mini_pos;
+            // The window starts where it was left (if that place is still on
+            // a display); afterwards it is only moved by the user.
+            let scale = ctx.pixels_per_point().max(0.5);
+            let (left, top, width, height) = crate::sys::desktop_rect();
+            self.st.mini_start = keep_on_screen(
+                self.settings.mini_pos,
+                MINI_SIZE,
+                (
+                    left as f32 / scale,
+                    top as f32 / scale,
+                    width as f32 / scale,
+                    height as f32 / scale,
+                ),
+            );
+            if self.st.mini_start.is_none() {
+                self.settings.mini_pos = None;
+                if let Ok(mut pos) = mini.position.lock() {
+                    *pos = None;
+                }
+            }
         }
+        mini.main_window.store(self.hwnd, Ordering::Relaxed);
         let mut builder = egui::ViewportBuilder::default()
             .with_title("PulseForge mini")
             .with_inner_size(MINI_SIZE)
@@ -343,6 +391,7 @@ impl App {
                     pages::columns_for(ui.available_width(), 210.0, 4),
                     &[
                         ("Move", "Drag it anywhere".to_string()),
+                        ("Open PulseForge", "Double-click it".to_string()),
                         ("Close", "Right-click, or its small x".to_string()),
                         ("Updates", "With every reading".to_string()),
                         ("Stays", "On top of other windows".to_string()),
@@ -374,12 +423,24 @@ fn mini_window(ctx: &egui::Context, shared: &Mutex<Shared>, mini: &MiniShared) {
             if surface.drag_started_by(egui::PointerButton::Primary) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
+            let mut open_main = surface.double_clicked();
             surface.context_menu(|ui| {
+                if ui.button("Open PulseForge").clicked() {
+                    open_main = true;
+                    ui.close_menu();
+                }
                 if ui.button("Close the mini widget").clicked() {
                     close = true;
                     ui.close_menu();
                 }
             });
+            if open_main {
+                // The main window may be asleep in the notification area:
+                // show it from here, then tell it so.
+                crate::sys::show_window(mini.main_window.load(Ordering::Relaxed));
+                mini.show_main.store(true, Ordering::Relaxed);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
             if mini_content(ui, rect, &data, fahrenheit, true) {
                 close = true;
             }
@@ -410,6 +471,36 @@ fn mini_window(ctx: &egui::Context, shared: &Mutex<Shared>, mini: &MiniShared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_widget_never_opens_off_screen() {
+        // One 1920 x 1080 display, and one of the same size to its left.
+        let one = (0.0, 0.0, 1920.0, 1080.0);
+        let two = (-1920.0, 0.0, 3840.0, 1080.0);
+        assert_eq!(keep_on_screen(None, MINI_SIZE, one), None);
+        assert_eq!(
+            keep_on_screen(Some((1600.0, 40.0)), MINI_SIZE, one),
+            Some((1600.0, 40.0))
+        );
+        // Left on the second display, which is still there ...
+        assert_eq!(
+            keep_on_screen(Some((-900.0, 300.0)), MINI_SIZE, two),
+            Some((-900.0, 300.0))
+        );
+        // ... or has been unplugged since.
+        assert_eq!(keep_on_screen(Some((-900.0, 300.0)), MINI_SIZE, one), None);
+        // Hanging over an edge is fine while enough of it can be grabbed.
+        assert!(keep_on_screen(Some((-100.0, 500.0)), MINI_SIZE, one).is_some());
+        assert!(keep_on_screen(Some((1900.0, 500.0)), MINI_SIZE, one).is_none());
+        assert!(keep_on_screen(Some((500.0, 1070.0)), MINI_SIZE, one).is_none());
+        assert!(keep_on_screen(Some((500.0, -30.0)), MINI_SIZE, one).is_none());
+        // Nonsense in, nothing out.
+        assert_eq!(keep_on_screen(Some((f32::NAN, 0.0)), MINI_SIZE, one), None);
+        assert_eq!(
+            keep_on_screen(Some((10.0, 10.0)), MINI_SIZE, (0.0, 0.0, 0.0, 0.0)),
+            None
+        );
+    }
     use crate::model::{CpuSample, GpuSample, MemorySample, NetSample};
 
     #[test]

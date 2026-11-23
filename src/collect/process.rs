@@ -805,7 +805,12 @@ mod tests {
         let counts = super::super::memory::system_counts().expect("counts were published");
         assert!(counts.processes as usize > list.len() / 2);
         assert!(counts.threads >= counts.processes && counts.handles > 0);
-        let total: f32 = list.iter().map(|p| p.cpu_pct).sum();
+        // The shares are judged over a real interval: over the fraction of a
+        // millisecond between the back-to-back calls above, a busy computer
+        // makes them meaningless.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let settled = sampler.sample(&gpu);
+        let total: f32 = settled.iter().map(|p| p.cpu_pct).sum();
         assert!(total <= 101.0 * 1.5, "sum of shares is {total}");
         println!(
             "process: {} entries, {named} named, avg {ms:.3} ms per call",

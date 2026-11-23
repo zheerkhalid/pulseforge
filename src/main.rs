@@ -19,7 +19,9 @@ const USAGE: &str = "PulseForge
                                       write a full system report and exit; serial numbers
                                       and names are masked unless --no-mask is given
   PulseForge.exe --selftest           run every collector once and print which ones
-                                      delivered data (no identifying values are printed)";
+                                      delivered data (no identifying values are printed)
+  PulseForge.exe --new-instance       open a second copy; without it, starting PulseForge
+                                      again shows the window of the copy that already runs";
 
 /// A windowed program has no console of its own: borrow the parent's, so
 /// that text output shows up when started from a terminal.
@@ -119,6 +121,16 @@ fn main() -> eframe::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // One copy at a time: starting PulseForge again shows the window of the
+    // copy that already runs (it may be hidden in the notification area).
+    let own_window = has("--demo") || has("--screenshot");
+    if !own_window
+        && !has(pulseforge::sys::NEW_INSTANCE_FLAG)
+        && pulseforge::sys::claim_instance(has("--tray")) == pulseforge::sys::Startup::HandOver
+    {
+        return Ok(());
     }
 
     let options = Options {

@@ -175,6 +175,45 @@ pub struct AlertEvent {
     pub message: String,
 }
 
+/// How many past events are kept, in memory and on disk.
+pub const EVENTS_KEPT: usize = 200;
+
+/// Reads the alert history saved by an earlier run. A missing or damaged
+/// file is simply an empty history; only the newest [`EVENTS_KEPT`] events
+/// are returned, oldest first.
+pub fn load_history(path: &std::path::Path) -> Vec<AlertEvent> {
+    let mut events: Vec<AlertEvent> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    events.retain(|e| e.value.is_finite() && e.threshold.is_finite());
+    let extra = events.len().saturating_sub(EVENTS_KEPT);
+    events.drain(..extra);
+    events
+}
+
+/// Writes the alert history (the newest [`EVENTS_KEPT`] events). An empty
+/// history removes the file.
+pub fn save_history<'a>(
+    path: &std::path::Path,
+    events: impl ExactSizeIterator<Item = &'a AlertEvent>,
+) -> Result<(), String> {
+    let skip = events.len().saturating_sub(EVENTS_KEPT);
+    let kept: Vec<&AlertEvent> = events.skip(skip).collect();
+    if kept.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("Could not clear the alert history: {e}")),
+        };
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string(&kept).map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| format!("Could not save the alert history: {e}"))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct State {
     /// Since when the reading has been past the threshold.
@@ -511,6 +550,41 @@ mod tests {
         let mut empty = Vec::new();
         normalize(&mut empty);
         assert_eq!(empty, default_rules());
+    }
+
+    #[test]
+    fn history_survives_a_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("pulseforge-alerts-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("alert-history.json");
+        assert!(load_history(&path).is_empty());
+        let mut engine = Engine::new();
+        let rules = [rule(Metric::CpuTemp, 90.0, 0)];
+        let mut events = engine.evaluate(&rules, &cpu(97.0), 0.0, 1000);
+        events.extend(engine.evaluate(&rules, &cpu(50.0), 1.0, 1001));
+        assert_eq!(events.len(), 2);
+        save_history(&path, events.iter()).unwrap();
+        assert_eq!(load_history(&path), events);
+        // Only the newest events are kept, oldest first.
+        let many: Vec<AlertEvent> = (0..EVENTS_KEPT as u64 + 50)
+            .map(|i| AlertEvent {
+                time: i,
+                ..events[0].clone()
+            })
+            .collect();
+        save_history(&path, many.iter()).unwrap();
+        let loaded = load_history(&path);
+        assert_eq!(loaded.len(), EVENTS_KEPT);
+        assert_eq!(loaded[0].time, 50);
+        assert_eq!(loaded.last().unwrap().time, EVENTS_KEPT as u64 + 49);
+        // Clearing removes the file; a damaged file is an empty history.
+        save_history(&path, [].iter()).unwrap();
+        assert!(!path.exists());
+        save_history(&path, [].iter()).unwrap();
+        std::fs::write(&path, "[{broken").unwrap();
+        assert!(load_history(&path).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

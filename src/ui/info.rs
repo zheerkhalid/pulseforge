@@ -269,7 +269,22 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        App::page_header(ui, "System", &subtitle, |ui| self.reveal_toggle(ui));
+        let mut copy = false;
+        App::page_header(ui, "System", &subtitle, |ui| {
+            if widgets::ghost_button(ui, &Icon::DOCUMENT.with("Copy summary"))
+                .on_hover_text(
+                    "Copies a short description of this computer (model, Windows, processor, memory, graphics, drives, displays) for pasting into a message. No serial numbers or names. Ctrl+Shift+C",
+                )
+                .clicked()
+            {
+                copy = true;
+            }
+            ui.add_space(6.0);
+            self.reveal_toggle(ui);
+        });
+        if copy {
+            self.copy_summary();
+        }
         let uptime = self.data.sample.uptime_s;
         pages::page_scroll(ui, |ui| {
             if !self.data.inventory_ready {

@@ -106,6 +106,68 @@ impl Tab {
         }
     }
 
+    /// The page's own name, as [`Tab::from_name`] reads it back (this is how
+    /// the last page is remembered in the settings).
+    pub fn name(self) -> &'static str {
+        match self {
+            Tab::Dashboard => "dashboard",
+            Tab::Cpu => "cpu",
+            Tab::Memory => "memory",
+            Tab::Gpu => "gpu",
+            Tab::Storage => "storage",
+            Tab::Network => "network",
+            Tab::Battery => "battery",
+            Tab::System => "system",
+            Tab::Displays => "displays",
+            Tab::Sensors => "sensors",
+            Tab::Processes => "processes",
+            Tab::Alerts => "alerts",
+            Tab::Settings => "settings",
+        }
+    }
+
+    /// The pages in the navigation rail, top to bottom. A computer without a
+    /// battery has no Battery page.
+    pub fn visible(has_battery: bool) -> Vec<Tab> {
+        Tab::ALL
+            .into_iter()
+            .filter(|t| has_battery || *t != Tab::Battery)
+            .collect()
+    }
+
+    /// The page behind Ctrl+1 ... Ctrl+9 and Ctrl+0 (the tenth): its place
+    /// in the navigation rail.
+    pub fn for_digit(digit: u8, has_battery: bool) -> Option<Tab> {
+        let place = match digit {
+            1..=9 => usize::from(digit) - 1,
+            0 => 9,
+            _ => return None,
+        };
+        Tab::visible(has_battery).get(place).copied()
+    }
+
+    /// "Ctrl+3" for the pages that have a number key.
+    pub fn shortcut(self, has_battery: bool) -> Option<String> {
+        let place = Tab::visible(has_battery).iter().position(|t| *t == self)?;
+        match place {
+            0..=8 => Some(format!("Ctrl+{}", place + 1)),
+            9 => Some("Ctrl+0".to_string()),
+            _ => None,
+        }
+    }
+
+    /// The next (or previous) page in the rail, wrapping round at the ends.
+    pub fn step(self, forward: bool, has_battery: bool) -> Tab {
+        let pages = Tab::visible(has_battery);
+        let n = pages.len();
+        let at = pages.iter().position(|t| *t == self).unwrap_or(0);
+        pages[if forward {
+            (at + 1) % n
+        } else {
+            (at + n - 1) % n
+        }]
+    }
+
     /// The names accepted by `--view`.
     pub fn from_name(name: &str) -> Option<Tab> {
         Some(match name {
@@ -124,7 +186,7 @@ impl Tab {
             "settings" => Tab::Settings,
             // Views that open a page in a particular state (see `App::apply_view`).
             "storage-health" | "storage-volumes" => Tab::Storage,
-            "end-task" => Tab::Processes,
+            "end-task" | "processes-grouped" | "processes-details" => Tab::Processes,
             "export" | "export-report" => Tab::Settings,
             "mini" | "mini-widget" | "mini-live" => Tab::Dashboard,
             _ => return None,
@@ -186,6 +248,9 @@ pub struct App {
     /// Frames left in which a `--tray` start hides the window again.
     hide_frames: u8,
     shot: Option<Shot>,
+    /// The window size seen last, and since when it has been that size: it
+    /// is written to the settings once it has stopped changing.
+    size_seen: Option<((f32, f32), Instant)>,
     /// What the pages remember between frames (selection, sorting, dialogs).
     pub(super) st: PageState,
 }
@@ -202,13 +267,21 @@ fn window_handle(cc: &eframe::CreationContext<'_>) -> isize {
 pub fn run(options: Options, icon: egui::IconData) -> eframe::Result<()> {
     sys::set_demo(options.demo);
     let hidden = options.start_hidden && options.screenshot.is_none() && !options.demo;
+    // The window opens at the size it was closed with (never for screenshots
+    // and the demo, which have their own fixed size).
+    let size = if options.screenshot.is_none() && !options.demo {
+        Settings::load().window_size
+    } else {
+        None
+    }
+    .unwrap_or((1280.0, 800.0));
     let viewport = egui::ViewportBuilder::default()
         .with_title(if options.demo {
             "PulseForge (demo)"
         } else {
             "PulseForge"
         })
-        .with_inner_size([1280.0, 800.0])
+        .with_inner_size([size.0.max(1040.0), size.1.max(660.0)])
         .with_min_inner_size([1040.0, 660.0])
         .with_visible(!hidden)
         .with_icon(icon.clone());
@@ -302,6 +375,7 @@ impl App {
                 requested: false,
                 started: Instant::now(),
             }),
+            size_seen: None,
             st: PageState::default(),
         };
         app.st.screenshot = options.screenshot.is_some();
@@ -315,7 +389,18 @@ impl App {
             sys::cloak_window(app.hwnd);
             app.hide_frames = 3;
         }
-        app.apply_view(options.view.as_deref().unwrap_or("dashboard"));
+        // Without a page named on the command line, the page that was open
+        // when the program was closed comes back.
+        let remembered = (app.settings.remember_page && !options.demo)
+            .then(|| app.settings.last_page.clone())
+            .and_then(|name| Tab::from_name(&name).map(|tab| tab.name()));
+        app.apply_view(
+            options
+                .view
+                .as_deref()
+                .or(remembered)
+                .unwrap_or("dashboard"),
+        );
         app.refresh_data();
         app
     }
@@ -438,7 +523,9 @@ impl App {
         }
         self.monitor.apply_settings(&self.settings);
         if let Some(tray) = &self.tray {
-            tray.set_enabled(self.settings.tray_icon);
+            // While the window is hidden the icon is the only way back to it,
+            // so it stays whatever the setting says.
+            tray.set_enabled(self.settings.tray_icon || sys::window_hidden());
             tray.set_mini(self.settings.mini_widget);
         }
         if !self.demo {
@@ -456,12 +543,7 @@ impl App {
     fn handle_tray(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.tray_rx.try_recv() {
             match event {
-                TrayEvent::Show => {
-                    self.hide_frames = 0;
-                    self.monitor.ui_visible.store(true, Ordering::Relaxed);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
+                TrayEvent::Show => self.bring_up(ctx),
                 TrayEvent::ToggleMini => self.settings.mini_widget = !self.settings.mini_widget,
                 TrayEvent::Exit => {
                     self.exiting = true;
@@ -502,6 +584,24 @@ impl App {
         }
     }
 
+    /// The window is on screen again (from the tray icon, the mini widget or
+    /// a second start of the program).
+    pub(super) fn bring_up(&mut self, ctx: &egui::Context) {
+        self.hide_frames = 0;
+        self.monitor.ui_visible.store(true, Ordering::Relaxed);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        if let Some(tray) = &self.tray {
+            // The icon may have been kept only because the window was hidden.
+            tray.set_enabled(self.settings.tray_icon);
+        }
+    }
+
+    /// True while a dialog covers the pages.
+    fn dialog_open(&self) -> bool {
+        self.about_open || self.st.export_open || self.st.end_task.is_some()
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let (escape, space) = ctx.input(|i| {
             (
@@ -518,6 +618,138 @@ impl App {
         }
         if space && !ctx.wants_keyboard_input() {
             self.toggle_pause();
+        }
+        if self.dialog_open() || self.st.mini_preview {
+            return;
+        }
+        const DIGITS: [Key; 10] = [
+            Key::Num0,
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Num9,
+        ];
+        let has_battery = self.data.sample.battery.is_some();
+        // (digit, next page, previous page, find, export, mini widget, read again, copy)
+        let keys = ctx.input(|i| {
+            let ctrl = i.modifiers.command && !i.modifiers.alt;
+            let plain = ctrl && !i.modifiers.shift;
+            (
+                DIGITS
+                    .iter()
+                    .position(|k| plain && i.key_pressed(*k))
+                    .map(|d| d as u8),
+                ctrl && !i.modifiers.shift && i.key_pressed(Key::Tab),
+                ctrl && i.modifiers.shift && i.key_pressed(Key::Tab),
+                plain && i.key_pressed(Key::F),
+                plain && i.key_pressed(Key::E),
+                plain && i.key_pressed(Key::M),
+                i.key_pressed(Key::F5) && !i.modifiers.any(),
+                // The toolkit turns Ctrl+C (with or without Shift) into a
+                // "copy" event instead of a key press.
+                ctrl && i.modifiers.shift
+                    && i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+            )
+        });
+        let (digit, next, previous, find, export, mini, reread, copy) = keys;
+        if let Some(tab) = digit.and_then(|d| Tab::for_digit(d, has_battery)) {
+            self.tab = tab;
+        }
+        if next || previous {
+            self.tab = self.tab.step(next, has_battery);
+        }
+        if find {
+            self.tab = Tab::Processes;
+            self.st.focus_search = true;
+        }
+        if export {
+            self.open_export();
+        }
+        if mini {
+            self.settings.mini_widget = !self.settings.mini_widget;
+        }
+        if reread {
+            self.read_again();
+        }
+        if copy {
+            self.copy_summary();
+        }
+    }
+
+    /// F5: reads the hardware list, the drives and their health again now.
+    pub(super) fn read_again(&mut self) {
+        self.monitor.refresh_inventory();
+        self.monitor.refresh_slow();
+        self.toast(
+            if self.demo {
+                "Demo mode: the invented hardware stays as it is."
+            } else {
+                "Reading the hardware and the drives again..."
+            },
+            false,
+        );
+    }
+
+    /// Puts a short description of the computer on the clipboard.
+    pub(super) fn copy_summary(&mut self) {
+        let (inventory, slow, sample) = self.monitor.snapshot();
+        let text = crate::report::summary(&inventory, &slow, &sample);
+        if text.is_empty() {
+            self.toast(
+                "The hardware is still being read. Try again in a moment.",
+                true,
+            );
+            return;
+        }
+        match sys::copy_to_clipboard(&text) {
+            Ok(()) => self.toast("A summary of this computer is on the clipboard.", false),
+            Err(e) => self.toast(e, !self.demo),
+        }
+    }
+
+    /// Remembers the window size (once it has stopped changing) and the page
+    /// that is open, so that the next start looks like this one.
+    fn remember_window(&mut self, ctx: &egui::Context) {
+        if self.demo || self.shot.is_some() {
+            return;
+        }
+        if !self.st.mini_preview && self.settings.last_page != self.tab.name() {
+            self.settings.last_page = self.tab.name().to_string();
+        }
+        let (size, maximized, minimized, fullscreen) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.inner_rect
+                    .map(|r| (r.width().round(), r.height().round())),
+                v.maximized.unwrap_or(false),
+                v.minimized.unwrap_or(false),
+                v.fullscreen.unwrap_or(false),
+            )
+        });
+        let Some(size) = size else { return };
+        // Only an ordinary window has a size worth coming back to.
+        if maximized || minimized || fullscreen || sys::window_hidden() || size.0 < 640.0 {
+            return;
+        }
+        match self.size_seen {
+            Some((seen, since)) if seen == size => {
+                if self.settings.window_size != Some(size) {
+                    if since.elapsed().as_millis() >= 800 {
+                        self.settings.window_size = Some(size);
+                    } else {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                    }
+                }
+            }
+            _ => {
+                self.size_seen = Some((size, Instant::now()));
+                ctx.request_repaint_after(std::time::Duration::from_millis(900));
+            }
         }
     }
 
@@ -743,7 +975,11 @@ impl App {
                             p.warn,
                         );
                     }
-                    if resp.clicked() {
+                    let clicked = resp.clicked();
+                    if let Some(keys) = tab.shortcut(has_battery) {
+                        resp.on_hover_text(keys);
+                    }
+                    if clicked {
                         self.tab = tab;
                     }
                 }
@@ -922,6 +1158,7 @@ impl eframe::App for App {
         self.end_task_dialog(ctx);
         self.mini_viewport(ctx);
         self.toasts_ui(ctx);
+        self.remember_window(ctx);
         self.sync_settings(ctx);
     }
 
@@ -956,5 +1193,57 @@ impl eframe::App for App {
             tray.stop();
         }
         self.monitor.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_page_is_remembered_by_its_name() {
+        for tab in Tab::ALL {
+            assert_eq!(Tab::from_name(tab.name()), Some(tab));
+        }
+        assert_eq!(Tab::from_name(""), None);
+    }
+
+    #[test]
+    fn number_keys_follow_the_navigation_rail() {
+        // With a battery: thirteen pages, the first ten have a key.
+        assert_eq!(Tab::for_digit(1, true), Some(Tab::Dashboard));
+        assert_eq!(Tab::for_digit(7, true), Some(Tab::Battery));
+        assert_eq!(Tab::for_digit(0, true), Some(Tab::Sensors));
+        assert_eq!(Tab::Battery.shortcut(true).as_deref(), Some("Ctrl+7"));
+        assert_eq!(Tab::Sensors.shortcut(true).as_deref(), Some("Ctrl+0"));
+        assert_eq!(Tab::Settings.shortcut(true), None);
+        // Without one the Battery page is not there and the rest moves up.
+        assert_eq!(Tab::for_digit(7, false), Some(Tab::System));
+        assert_eq!(Tab::for_digit(0, false), Some(Tab::Processes));
+        assert_eq!(Tab::Battery.shortcut(false), None);
+        assert_eq!(Tab::for_digit(42, true), None);
+        // What the tooltip promises is what the key does.
+        for battery in [true, false] {
+            for (i, tab) in Tab::visible(battery).into_iter().enumerate().take(10) {
+                let digit = ((i + 1) % 10) as u8;
+                assert_eq!(Tab::for_digit(digit, battery), Some(tab));
+                assert_eq!(
+                    tab.shortcut(battery),
+                    Some(format!("Ctrl+{digit}")),
+                    "{tab:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stepping_through_the_pages_wraps_round() {
+        assert_eq!(Tab::Dashboard.step(true, true), Tab::Cpu);
+        assert_eq!(Tab::Dashboard.step(false, true), Tab::Settings);
+        assert_eq!(Tab::Settings.step(true, false), Tab::Dashboard);
+        // The Battery page is skipped on a computer without a battery.
+        assert_eq!(Tab::Network.step(true, false), Tab::System);
+        assert_eq!(Tab::System.step(false, false), Tab::Network);
+        assert_eq!(Tab::Network.step(true, true), Tab::Battery);
     }
 }

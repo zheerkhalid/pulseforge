@@ -169,11 +169,15 @@ pub fn run() -> (Vec<Check>, bool) {
         true,
         slow.volumes.iter().any(|v| v.total > 0),
         format!(
-            "{} found, {} mapped to a drive",
+            "{} found, {} mapped to a drive, encryption state known for {}",
             slow.volumes.len(),
             slow.volumes
                 .iter()
                 .filter(|v| v.drive_index.is_some())
+                .count(),
+            slow.volumes
+                .iter()
+                .filter(|v| v.bitlocker.is_some())
                 .count()
         ),
     ));

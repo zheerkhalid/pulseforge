@@ -971,6 +971,17 @@ fn processes(
         .collect();
     let sum: f64 = levels.iter().sum::<f64>().max(0.001);
     let scale = cpu_total * 0.97 / sum;
+    let pid_of = |i: usize| -> u32 {
+        match i {
+            0 => 0,
+            1 => 4,
+            _ => 400 + i as u32 * 52 + (hash(400, i as i64) * 12.0) as u32 * 4,
+        }
+    };
+    let shell = PROCESSES
+        .iter()
+        .position(|spec| spec.name == "File Explorer")
+        .map_or(4, pid_of);
     PROCESSES
         .iter()
         .enumerate()
@@ -998,13 +1009,13 @@ fn processes(
                 _ => Some((igpu_load * f64::from(spec.weight) / 22.0).min(igpu_load) as f32),
             };
             ProcessSample {
-                pid: match i {
-                    0 => 0,
-                    1 => 4,
-                    _ => 400 + i as u32 * 52 + (hash(400, i as i64) * 12.0) as u32 * 4,
-                },
-                parent_pid: if i < 8 { 4 } else { 812 },
-                name: s(spec.name),
+                pid: pid_of(i),
+                // Programs are started by the shell, like on a real desktop.
+                parent_pid: if i < 8 { 4 } else { shell },
+                // Like on a real computer, the helper processes of a program
+                // carry the program's name (the part in brackets only tells
+                // them apart in the table above).
+                name: s(spec.name.split(" (").next().unwrap_or(spec.name)),
                 cpu_pct: cpu.clamp(0.0, 100.0) as f32,
                 memory: (memory * MB as f64) as u64,
                 disk_read_bps: f64::from(spec.disk.0) * MB as f64 * active,

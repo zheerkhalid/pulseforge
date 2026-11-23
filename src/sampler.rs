@@ -32,8 +32,7 @@ const ECONOMY_CLOCK_PERIOD_S: f64 = 4.9;
 const ECONOMY_GPU_PERIOD_S: f64 = 2.9;
 /// Seconds between process-list readings (slightly under two ticks at 1 s).
 const PROCESS_PERIOD_S: f64 = 1.9;
-/// Alert events kept for the Alerts page.
-const EVENTS_KEPT: usize = 200;
+use alerts::EVENTS_KEPT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -112,6 +111,8 @@ pub struct Config {
     pub rules: Vec<AlertRule>,
     /// Folder and row interval, when CSV logging is on.
     pub log: Option<(PathBuf, u32)>,
+    /// Days a CSV log file is kept; 0 keeps them for ever.
+    pub log_keep_days: u32,
     pub tray_value: TrayValue,
     pub fahrenheit: bool,
 }
@@ -123,6 +124,7 @@ impl Config {
             alerts_enabled: s.alerts_enabled,
             rules: s.alerts.clone(),
             log: s.log_csv.then(|| (s.log_folder(), s.log_interval_s)),
+            log_keep_days: s.log_keep_days,
             tray_value: s.tray_value,
             fahrenheit: s.fahrenheit,
         }
@@ -134,6 +136,7 @@ enum Cmd {
     Tray(Option<Tray>),
     RefreshInventory,
     RefreshSlow,
+    ClearEvents,
     InventoryDone(Box<Inventory>),
     SlowDone(Box<Slow>),
     Stop,
@@ -158,6 +161,12 @@ impl Monitor {
         let ui_visible = Arc::new(AtomicBool::new(true));
         let (tx, rx) = channel();
         let config = Config::from_settings(settings);
+        if source == Source::Real {
+            // What the alerts reported in earlier runs.
+            if let Ok(mut s) = shared.lock() {
+                s.events = alerts::load_history(&history_path()).into();
+            }
+        }
         if source == Source::Demo {
             // Ready before the first frame, so screenshots never show a loading state.
             let mut source = DemoSource::new();
@@ -211,6 +220,11 @@ impl Monitor {
         let _ = self.tx.send(Cmd::RefreshSlow);
     }
 
+    /// Empties the alert history, in memory and on disk.
+    pub fn clear_events(&self) {
+        let _ = self.tx.send(Cmd::ClearEvents);
+    }
+
     /// A consistent copy of the current data, for reports.
     pub fn snapshot(&self) -> (Arc<Inventory>, Arc<Slow>, Arc<Sample>) {
         match self.shared.lock() {
@@ -228,6 +242,11 @@ impl Drop for Monitor {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Where the alert history is kept between runs.
+pub fn history_path() -> PathBuf {
+    sys::app_dir().join("alert-history.json")
 }
 
 // ----------------------------------------------------------------------------------
@@ -741,6 +760,7 @@ impl Worker {
         let mut demo_source = DemoSource::new();
         let mut engine = Engine::new();
         let mut logger: Option<Logger> = None;
+        let mut pruned_at: Option<Instant> = None;
         let mut tray: Option<Tray> = None;
         let mut slow_running = false;
         let mut slow_at = Instant::now();
@@ -788,6 +808,10 @@ impl Worker {
                         if c.interval_ms != self.config.interval_ms {
                             next = Instant::now();
                         }
+                        if c.log != self.config.log || c.log_keep_days != self.config.log_keep_days
+                        {
+                            pruned_at = None;
+                        }
                         if c.log != self.config.log {
                             logger = None;
                             if let Ok(mut s) = self.shared.lock() {
@@ -808,6 +832,15 @@ impl Worker {
                             self.spawn_slow();
                             slow_running = true;
                         }
+                    }
+                    Some(Cmd::ClearEvents) => {
+                        if let Ok(mut s) = self.shared.lock() {
+                            s.events.clear();
+                        }
+                        if !demo {
+                            let _ = alerts::save_history(&history_path(), [].iter());
+                        }
+                        (self.wake)();
                     }
                     Some(Cmd::InventoryDone(inv)) => {
                         inventory = Arc::new(*inv);
@@ -915,6 +948,12 @@ impl Worker {
                 if let Some((dir, every)) = &self.config.log {
                     let l = logger.get_or_insert_with(|| Logger::new(dir, *every));
                     log_result = Some((l.log(&sample, &slow), l.current_file()));
+                    // Old log files go once at the start and then once an hour.
+                    let due = pruned_at.is_none_or(|at| at.elapsed().as_secs() >= 3600);
+                    if due && self.config.log_keep_days > 0 {
+                        pruned_at = Some(Instant::now());
+                        crate::csvlog::prune(dir, sample.time, self.config.log_keep_days);
+                    }
                 }
             }
 
@@ -930,6 +969,8 @@ impl Worker {
             last_cpu = cpu_now;
             last_wall = Instant::now();
 
+            let new_events = !events.is_empty();
+            let mut to_save = None;
             if let Ok(mut s) = self.shared.lock() {
                 record(&mut s.history, t, &sample, &inventory, &slow);
                 s.history.push(keys::SELF_CPU, t, self_pct);
@@ -940,6 +981,9 @@ impl Worker {
                 }
                 while s.events.len() > EVENTS_KEPT {
                     s.events.pop_front();
+                }
+                if new_events && !demo {
+                    to_save = Some(s.events.clone());
                 }
                 s.active_alerts = engine.active();
                 s.overhead = Overhead {
@@ -962,6 +1006,10 @@ impl Worker {
                         Err(e) => s.log_error = Some(e),
                     }
                 }
+            }
+            if let Some(events) = to_save {
+                // Kept between runs; a failure here must never stop monitoring.
+                let _ = alerts::save_history(&history_path(), events.iter());
             }
             if visible {
                 (self.wake)();

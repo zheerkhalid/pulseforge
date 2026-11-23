@@ -1,7 +1,11 @@
 ; PulseForge installer (Inno Setup 6). Installs for the current user only: no administrator rights needed.
 
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.1.0"
+#endif
+; Where cargo put the build (scripts/package.ps1 passes CARGO_TARGET_DIR when it is set).
+#ifndef TargetDir
+  #define TargetDir "..\target"
 #endif
 
 [Setup]
@@ -21,7 +25,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible 
 OutputDir=..\dist
 OutputBaseFilename=PulseForge-Setup
-SetupIconFile=..\target\pulseforge.ico
+SetupIconFile={#TargetDir}\pulseforge.ico
 UninstallDisplayIcon={app}\PulseForge.exe
 Compression=lzma2/ultra64
 SolidCompression=yes
@@ -37,7 +41,7 @@ VersionInfoDescription=PulseForge Setup
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; 
 
 [Files]
-Source: "..\target\release\PulseForge.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#TargetDir}\release\PulseForge.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]

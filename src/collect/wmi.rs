@@ -23,6 +23,8 @@ const AUTHN_WINNT: u32 = 10;
 const AUTHZ_NONE: u32 = 0;
 /// Longest wait for the next row, in milliseconds.
 const ROW_TIMEOUT_MS: i32 = 5000;
+/// `IEnumWbemClassObject::Next` gave up waiting (a success code, not an error).
+const WBEM_S_TIMEDOUT: i32 = 0x0004_0004;
 /// A query never returns more rows than this to the caller.
 const MAX_ROWS: usize = 4096;
 /// Properties read per row at most.
@@ -174,6 +176,14 @@ pub fn query(namespace: &str, wql: &str) -> Result<Vec<Row>, String> {
             // Semi-synchronous queries report their failure on the first fetch.
             if out.is_empty() {
                 return Err(format!("the WMI query failed (0x{:08X})", hr.0 as u32));
+            }
+            break;
+        }
+        // "Timed out" is a success code: without this check a slow answer
+        // (a busy computer) would be taken for "no rows".
+        if hr.0 == WBEM_S_TIMEDOUT {
+            if out.is_empty() {
+                return Err("WMI did not answer in time".to_string());
             }
             break;
         }

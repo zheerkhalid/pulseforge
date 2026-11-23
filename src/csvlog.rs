@@ -92,6 +92,55 @@ pub fn file_name(unix: u64) -> String {
     format!("pulseforge-{y:04}{m:02}{d:02}.csv")
 }
 
+/// The day a log file was written for, counted in days since 1970, when
+/// `name` is one of PulseForge's own log files (`pulseforge-YYYYMMDD.csv`).
+/// Anything else in the folder is none of our business.
+pub fn file_day(name: &str) -> Option<i64> {
+    let digits = name.strip_prefix("pulseforge-")?.strip_suffix(".csv")?;
+    if digits.len() != 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let y: i64 = digits[..4].parse().ok()?;
+    let m: u32 = digits[4..6].parse().ok()?;
+    let d: u32 = digits[6..].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(util::days_from_civil(y, m, d))
+}
+
+/// True when the log file `name` is older than `keep_days` on the day
+/// `today` (days since 1970). `keep_days` 0 keeps everything.
+pub fn expired(name: &str, today: i64, keep_days: u32) -> bool {
+    match file_day(name) {
+        Some(day) if keep_days > 0 => today - day > i64::from(keep_days),
+        _ => false,
+    }
+}
+
+/// Deletes PulseForge's own log files in `dir` that are older than
+/// `keep_days`. Other files are never touched. Returns how many went.
+pub fn prune(dir: &Path, unix_now: u64, keep_days: u32) -> usize {
+    if keep_days == 0 {
+        return 0;
+    }
+    let (y, m, d, ..) = util::local_parts(unix_now);
+    let today = util::days_from_civil(y, m, d);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+        if is_file && expired(&name, today, keep_days) && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Appends rows to the file of the day, starting a new file at midnight.
 pub struct Logger {
     dir: PathBuf,
@@ -242,6 +291,62 @@ mod tests {
         assert!(lines[1..]
             .iter()
             .all(|l| l.split(',').count() == COLUMNS.len()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_our_own_old_files_expire() {
+        let day = file_day("pulseforge-20261116.csv").unwrap();
+        assert_eq!(file_day("pulseforge-20261117.csv"), Some(day + 1));
+        assert_eq!(file_day("pulseforge-20261301.csv"), None);
+        assert_eq!(file_day("pulseforge-2026111.csv"), None);
+        assert_eq!(file_day("pulseforge-20261116.csv.bak"), None);
+        assert_eq!(file_day("notes.csv"), None);
+        assert_eq!(file_day("pulseforge-2026111é.csv"), None);
+        // Kept for seven days: the eighth day is the first without it.
+        assert!(!expired("pulseforge-20261116.csv", day + 7, 7));
+        assert!(expired("pulseforge-20261116.csv", day + 8, 7));
+        // 0 keeps everything; foreign files never expire.
+        assert!(!expired("pulseforge-20261116.csv", day + 5000, 0));
+        assert!(!expired("budget-20200101.csv", day, 7));
+    }
+
+    #[test]
+    fn pruning_removes_old_logs_and_nothing_else() {
+        let dir =
+            std::env::temp_dir().join(format!("pulseforge-prune-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Midday UTC on 2027-01-15.
+        let now = 1_800_014_400;
+        let today = file_name(now);
+        for name in [
+            "pulseforge-20200101.csv",
+            "pulseforge-20261201.csv",
+            today.as_str(),
+            "mine-20200101.csv",
+            "pulseforge-20200101.txt",
+        ] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("pulseforge-20190101.csv")).unwrap();
+        assert_eq!(prune(&dir, now, 0), 0);
+        assert_eq!(prune(&dir, now, 30), 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        let mut expected = vec![
+            "mine-20200101.csv".to_string(),
+            "pulseforge-20190101.csv".to_string(),
+            "pulseforge-20200101.txt".to_string(),
+            today,
+        ];
+        expected.sort();
+        assert_eq!(left, expected);
+        assert_eq!(prune(&dir.join("missing"), now, 30), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
